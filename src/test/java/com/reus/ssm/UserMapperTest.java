@@ -10,7 +10,8 @@ import com.reus.ssm.mapper.UserMapper;
 import com.reus.ssm.model.User;
 
 /**
- * Created by 言曌 on 2017/8/14.
+ * @author reus
+ * @version $Id: UserMapperTest.java, v 0.1 2017-12-14 reus Exp $
  */
 @RunWith(SpringJUnit4ClassRunner.class)
 @ContextConfiguration("classpath:spring/applicationContext.xml")
