@@ -4,20 +4,14 @@
  */
 package com.reus.ssm.utils;
 
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.ConnectException;
-import java.net.HttpURLConnection;
-import java.net.MalformedURLException;
-import java.net.SocketTimeoutException;
-import java.net.URL;
+import java.io.*;
+import java.net.*;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -26,20 +20,22 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class HttpDownloader {
 
-    private boolean       resumable;
-    private URL           url;
-    private File          localFile;
-    private int[]         endPoint;
-    private Object        waiting         = new Object();
-    private AtomicInteger downloadedBytes = new AtomicInteger(0);
-    private AtomicInteger aliveThreads    = new AtomicInteger(0);
-    private boolean       multithreaded   = true;
-    private int           fileSize        = 0;
-    private int           THREAD_NUM      = 5;
-    private int           TIME_OUT        = 5000;
-    private final int     MIN_SIZE        = 2 << 20;
+    private ExecutorService  executor;
+    private CountDownLatch   countDownLatch;
+    private boolean          resumable;
+    private URL              url;
+    private File             localFile;
+    private int[]            endPoint;
+    private AtomicInteger    downloadedBytes = new AtomicInteger(0);
+    private AtomicInteger    aliveThreads    = new AtomicInteger(0);
+    private boolean          multithreaded   = true;
+    private int              fileSize        = 0;
+    private int              THREAD_NUM      = 5;
+    private int              TIME_OUT        = 5000;
+    private final int        MIN_SIZE        = 2 << 20;
+    private volatile boolean finish          = false;
 
-    public static void main(String[] args) throws IOException {
+    public static void main(String[] args) throws IOException, InterruptedException {
         String url = "http://mirrors.163.com/debian/ls-lR.gz";
         new HttpDownloader(url, "ls-lR.gz", 5, 5000).get();
     }
@@ -47,6 +43,7 @@ public class HttpDownloader {
     public HttpDownloader(String Url, String localPath) throws MalformedURLException {
         this.url = new URL(Url);
         this.localFile = new File(localPath);
+        executor = Executors.newFixedThreadPool(THREAD_NUM);
     }
 
     public HttpDownloader(String Url, String localPath, int threadNum,
@@ -54,19 +51,21 @@ public class HttpDownloader {
         this(Url, localPath);
         this.THREAD_NUM = threadNum;
         this.TIME_OUT = timeout;
+        executor = Executors.newFixedThreadPool(THREAD_NUM > 5 ? 5 : threadNum);
     }
 
     //开始下载文件
-    public void get() throws IOException {
+    public void get() throws IOException, InterruptedException {
         long startTime = System.currentTimeMillis();
-
         resumable = supportResumeDownload();
         if (!resumable || THREAD_NUM == 1 || fileSize < MIN_SIZE)
             multithreaded = false;
         if (!multithreaded) {
+            //但文件下载或者不支持断点下载
             new DownloadThread(0, 0, fileSize - 1).start();
-            ;
+            countDownLatch = new CountDownLatch(1);
         } else {
+            countDownLatch = new CountDownLatch(THREAD_NUM);
             endPoint = new int[THREAD_NUM + 1];
             int block = fileSize / THREAD_NUM;
             for (int i = 0; i < THREAD_NUM; i++) {
@@ -74,27 +73,21 @@ public class HttpDownloader {
             }
             endPoint[THREAD_NUM] = fileSize;
             for (int i = 0; i < THREAD_NUM; i++) {
-                new DownloadThread(i, endPoint[i], endPoint[i + 1] - 1).start();
+                executor.submit(new DownloadThread(i, endPoint[i], endPoint[i + 1] - 1));
             }
         }
 
         startDownloadMonitor();
 
         //等待 downloadMonitor 通知下载完成
-        try {
-            synchronized (waiting) {
-                waiting.wait();
-            }
-        } catch (InterruptedException e) {
-            System.err.println("Download interrupted.");
-        }
-
+        countDownLatch.await();
+        executor.shutdown();
         cleanTempFile();
-
+        finish = true;
         long timeElapsed = System.currentTimeMillis() - startTime;
         System.out.println("* File successfully downloaded.");
         System.out.println(String.format("* Time used: %.3f s, Average speed: %d KB/s",
-                timeElapsed / 1000.0, downloadedBytes.get() / timeElapsed));
+            timeElapsed / 1000.0, downloadedBytes.get() / timeElapsed));
     }
 
     //检测目标文件是否支持断点续传，以决定是否开启多线程下载文件的不同部分
@@ -126,24 +119,17 @@ public class HttpDownloader {
     public void startDownloadMonitor() {
         Thread downloadMonitor = new Thread(() -> {
             int prev = 0;
-            int curr = 0;
-            while (true) {
+            int curr;
+            while (!finish) {
                 try {
                     Thread.sleep(1000);
                 } catch (InterruptedException e) {
                 }
-
                 curr = downloadedBytes.get();
                 System.out.println(String.format(
-                        "Speed: %d KB/s, Downloaded: %d KB (%.2f%%), Threads: %d", (curr - prev) >> 10,
-                        curr >> 10, curr / (float) fileSize * 100, aliveThreads.get()));
+                    "Speed: %d KB/s, Downloaded: %d KB (%.2f%%), Threads: %d", (curr - prev) >> 10,
+                    curr >> 10, curr / (float) fileSize * 100, aliveThreads.get()));
                 prev = curr;
-
-                if (aliveThreads.get() == 0) {
-                    synchronized (waiting) {
-                        waiting.notifyAll();
-                    }
-                }
             }
         });
 
@@ -158,7 +144,7 @@ public class HttpDownloader {
             System.out.println("* Temp file merged.");
         } else {
             Files.move(Paths.get(localFile.getAbsolutePath() + ".0.tmp"),
-                    Paths.get(localFile.getAbsolutePath()), StandardCopyOption.REPLACE_EXISTING);
+                Paths.get(localFile.getAbsolutePath()), StandardCopyOption.REPLACE_EXISTING);
         }
     }
 
@@ -198,7 +184,7 @@ public class HttpDownloader {
         //保证文件的该部分数据下载完成
         @Override
         public void run() {
-            boolean success = false;
+            boolean success;
             while (true) {
                 success = download();
                 if (success) {
@@ -209,6 +195,7 @@ public class HttpDownloader {
                 }
             }
             aliveThreads.decrementAndGet();
+            countDownLatch.countDown();
         }
 
         //下载文件指定范围的部分
